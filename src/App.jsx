@@ -78,6 +78,51 @@ function runPFF(nf,ref,thr=2){
   return{steps,faults};
 }
 
+/* Adaptive Working Set: combines sliding-window WS + PFF threshold adaptation */
+function runAdaptiveWS(nf,ref,wsWindow=3,pffThresh=3){
+  let mem=[],faults=0,lastFault=-pffThresh-1,steps=[];
+  let dynWindow=wsWindow; // starts at user window, adapts
+  for(let i=0;i<ref.length;i++){
+    const p=ref[i];
+    // compute working set from dynamic window
+    const wsSet=new Set(ref.slice(Math.max(0,i-dynWindow+1),i+1));
+    // evict pages not in working set
+    mem=mem.filter(x=>wsSet.has(x));
+    if(mem.includes(p)){
+      // HIT
+      const pad=[...mem,...Array(Math.max(0,nf-mem.length)).fill(null)];
+      const interFault=i-lastFault;
+      const status=interFault<pffThresh?"high":"stable";
+      steps.push({page:p,frames:pad,hit:true,fault:false,evicted:null,
+        workingSet:[...wsSet],dynWindow,faultFreq:Math.round(faults/(i+1)*100)/100,status});
+    } else {
+      // FAULT
+      faults++;
+      const interFault=i-lastFault;
+      let adapted=false;
+      if(interFault<pffThresh){
+        // high fault rate → expand window to retain more pages
+        dynWindow=Math.min(dynWindow+1,ref.length);
+        adapted=true;
+      } else if(interFault>pffThresh*2&&dynWindow>1){
+        // low fault rate → shrink window to free memory
+        dynWindow=Math.max(dynWindow-1,1);
+      }
+      lastFault=i;
+      // recompute WS with updated window
+      const newWS=new Set(ref.slice(Math.max(0,i-dynWindow+1),i+1));
+      mem=mem.filter(x=>newWS.has(x));
+      if(!mem.includes(p)){
+        if(mem.length>=nf){const ev=mem.shift();steps.push({page:p,frames:[...mem,...Array(Math.max(0,nf-mem.length)).fill(null)],hit:false,fault:true,evicted:ev,workingSet:[...newWS],dynWindow,faultFreq:Math.round(faults/(i+1)*100)/100,status:adapted?"adjusting":"high",adapted});}
+        else{mem.push(p);steps.push({page:p,frames:[...mem,...Array(Math.max(0,nf-mem.length)).fill(null)],hit:false,fault:true,evicted:null,workingSet:[...newWS],dynWindow,faultFreq:Math.round(faults/(i+1)*100)/100,status:adapted?"adjusting":"high",adapted});}
+      } else {
+        steps.push({page:p,frames:[...mem,...Array(Math.max(0,nf-mem.length)).fill(null)],hit:false,fault:true,evicted:null,workingSet:[...newWS],dynWindow,faultFreq:Math.round(faults/(i+1)*100)/100,status:adapted?"adjusting":"high",adapted});
+      }
+    }
+  }
+  return{steps,faults};
+}
+
 const ALGOS={
   FIFO:      {id:"FIFO",      label:"FIFO",       full:"First In, First Out",   type:"Classic", run:runFIFO,      desc:"Evicts the page that arrived earliest in memory.",      complexity:"O(n)",   color:"#3b82f6"},
   LRU:       {id:"LRU",       label:"LRU",        full:"Least Recently Used",   type:"Classic", run:runLRU,       desc:"Evicts the page unused for the longest time.",          complexity:"O(n)",   color:"#6366f1"},
@@ -85,12 +130,14 @@ const ALGOS={
   Clock:     {id:"Clock",     label:"Clock",      full:"Clock / Second Chance", type:"Classic", run:runClock,     desc:"Circular buffer giving pages a second chance.",         complexity:"O(f)",  color:"#a855f7"},
   WorkingSet:{id:"WorkingSet",label:"Working Set",full:"Working Set Model",     type:"Adaptive",run:runWorkingSet,desc:"Keeps active working-window pages in memory.",           complexity:"O(n·w)",color:"#06b6d4"},
   PFF:       {id:"PFF",       label:"PFF",        full:"Page Fault Frequency",  type:"Adaptive",run:runPFF,       desc:"Adapts resident set size by monitoring fault rate.",    complexity:"O(n)",  color:"#0ea5e9"},
+  AWS:       {id:"AWS",       label:"AWS",        full:"Adaptive Working Set",  type:"Hybrid",  run:runAdaptiveWS,desc:"Dynamically adjusts memory using working set and PFF to prevent thrashing.",complexity:"O(n·w)",color:"#f59e0b"},
 };
 const PRESETS=[
   {name:"OS Textbook",     ref:"7,0,1,2,0,3,0,4,2,3,0,3,2,1,2,0,1,7,0,1"},
   {name:"Locality Pattern",ref:"1,2,3,4,1,2,5,1,2,3,4,5"},
   {name:"Thrashing Case",  ref:"1,2,3,4,5,1,2,3,4,5,1,2,3,4,5"},
   {name:"High Hit Rate",   ref:"1,1,2,2,3,3,1,1,2,2,3,3,4,4"},
+  {name:"AWS Showcase",    ref:"1,2,3,4,5,1,2,1,2,3,6,7,1,2,3,1,2,3,4,5,6"},
 ];
 const LEARN_DATA={
   FIFO:      {steps:["Page arrives — check if already in memory","HIT: no change","FAULT: check for empty frame","Empty frame available? Load page directly","All frames full? Remove oldest page (queue front), load new"],pros:["Dead simple to implement","No usage tracking needed","Predictable, deterministic"],cons:["Belady's Anomaly: more frames can mean more faults","Ignores recency of use","Poor real-world performance"],ex:"Queue: [1,2,3] → Page 4 faults → Evict 1 → [2,3,4]"},
@@ -99,6 +146,7 @@ const LEARN_DATA={
   Clock:     {steps:["Maintain circular buffer of frames with R-bits","New page load: set reference bit = 1","On fault: sweep clock pointer clockwise","R=1 → clear to 0, advance pointer","R=0 → evict this page, insert new page"],pros:["Good LRU approximation","Hardware-friendly — only one R-bit per frame","Efficient O(frames) per eviction"],cons:["Less accurate than true LRU","All-ones case degrades to FIFO behavior","Pointer position affects results"],ex:"[A:1, B:1, C:0, D:1] ptr→C → Evict C, set R=1"},
   WorkingSet:{steps:["Define time window Δ (last N references)","Working Set = distinct pages in window","Allocate frames to hold entire working set","Pages outside window are eviction candidates","Dynamically resize allocation as WS changes"],pros:["Prevents thrashing effectively","Adapts to locality phases of a program","Matches realistic process memory behavior"],cons:["Choosing Δ is non-trivial","Higher bookkeeping per reference","Allocation can lag behind phase changes"],ex:"Δ=3, recent=[1,2,1] → WS={1,2} → evict page 3"},
   PFF:       {steps:["Track time intervals between consecutive page faults","Inter-fault time < threshold → HIGH fault rate","High rate: allocate more frames to process","Inter-fault time > threshold → LOW fault rate","Low rate: reclaim frames, evict cold pages"],pros:["Prevents over and under-allocation","Continuously adapts to workload changes","Efficient global memory utilization"],cons:["Threshold requires careful tuning","Reacts with some delay to sudden changes","More complex OS-level implementation needed"],ex:"Fast faults → expand resident set. Slow faults → shrink & reclaim"},
+  AWS:       {steps:["Maintain a sliding working-set window Δ (starts at user value)","On each reference: compute WS = distinct pages in last Δ steps","Evict pages not in current working set","If fault rate HIGH (inter-fault < PFF threshold) → expand Δ","If fault rate LOW (inter-fault > 2× threshold) → shrink Δ","Dynamically balance memory pressure vs. thrashing prevention"],pros:["Combines best of WS locality + PFF adaptivity","Self-tuning: window grows/shrinks without manual intervention","Minimises thrashing while reclaiming idle memory","Outperforms static algorithms in phase-shifting workloads"],cons:["Two parameters (window + threshold) to initialise","Slightly higher bookkeeping than pure WS or PFF alone","Window expansion lag can cause short thrashing bursts"],ex:"Δ=3, PFF thr=3 → 4 faults in 3 steps → expand Δ to 4 → WS grows → faults drop"},
 };
 
 /* ════════════════════════════════════════════════════════
@@ -145,6 +193,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;heigh
 @keyframes drift{0%,100%{transform:translateY(0) translateX(0)}33%{transform:translateY(-20px) translateX(10px)}66%{transform:translateY(12px) translateX(-8px)}}
 @keyframes scanPulse{0%,100%{opacity:0.2}50%{opacity:0.6}}
 @keyframes glowBeat{0%,100%{box-shadow:0 0 0 0 rgba(59,130,246,0.5)}50%{box-shadow:0 0 0 6px rgba(59,130,246,0)}}
+@keyframes glowAmber{0%,100%{box-shadow:0 0 0 0 rgba(245,158,11,0.6)}50%{box-shadow:0 0 0 8px rgba(245,158,11,0)}}
 .pv{animation:fadeUp 0.28s ease both;}
 .ff{animation:pF 0.55s ease;}
 .fh{animation:pH 0.45s ease;}
@@ -181,8 +230,8 @@ export default function App(){
   ];
 
   return(
-    <div style={{fontFamily:C.body,background:C.bg0,color:C.t0,minHeight:"100vh",display:"flex",position:"relative"}}>
-      <style>{CSS}</style>
+    <div style={{fontFamily:C.body,background:C.bg0,color:C.t0,width:"100vw",height:"100vh",display:"flex",position:"fixed",top:0,left:0,overflow:"hidden"}}>
+      <style>{CSS+`html,body,#root,#app{margin:0!important;padding:0!important;width:100%!important;max-width:100%!important;height:100%!important;background:#07090F!important;overflow:hidden!important;}*{box-sizing:border-box;}`}</style>
       {/* cursor glow */}
       <div style={{position:"fixed",pointerEvents:"none",zIndex:9999,width:480,height:480,borderRadius:"50%",
         background:"radial-gradient(circle,rgba(59,130,246,0.032) 0%,transparent 65%)",
@@ -192,7 +241,7 @@ export default function App(){
       {!isLanding&&(
         <aside style={{width:collapsed?52:196,flexShrink:0,background:C.bg1,borderRight:`1px solid ${C.b0}`,
           display:"flex",flexDirection:"column",transition:"width 0.2s ease",overflow:"hidden",
-          position:"sticky",top:0,height:"100vh",zIndex:100}}>
+          height:"100vh",zIndex:100}}>
           <div style={{padding:"15px 11px",borderBottom:`1px solid ${C.b0}`,display:"flex",alignItems:"center",gap:9,minHeight:52}}>
             <div style={{width:26,height:26,flexShrink:0,background:"linear-gradient(135deg,#3B82F6,#8B5CF6)",
               borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center",
@@ -219,11 +268,11 @@ export default function App(){
         </aside>
       )}
 
-      <div style={{flex:1,display:"flex",flexDirection:"column",minWidth:0}}>
+      <div style={{flex:1,display:"flex",flexDirection:"column",minWidth:0,width:0,height:"100vh"}}>
         {/* topbar */}
         {!isLanding&&(
           <header style={{height:48,borderBottom:`1px solid ${C.b0}`,display:"flex",alignItems:"center",
-            justifyContent:"space-between",padding:"0 20px",background:C.bg1,position:"sticky",top:0,zIndex:50,flexShrink:0}}>
+            justifyContent:"space-between",padding:"0 20px",background:C.bg1,flexShrink:0,zIndex:50}}>
             <div style={{display:"flex",alignItems:"center",gap:6}}>
               <span style={{color:C.t2,fontSize:11,fontFamily:C.mono}}>~/</span>
               <span style={{color:C.t1,fontSize:12,fontWeight:500}}>{NAV.find(n=>n.id===view)?.label}</span>
@@ -237,8 +286,8 @@ export default function App(){
             </div>
           </header>
         )}
-        <main style={{flex:1,overflow:"auto"}}>
-          <div className="pv" key={view}>
+        <main style={{flex:1,overflowY:"auto",overflowX:"hidden",width:"100%"}}>
+          <div className="pv" key={view} style={{minHeight:"100%",width:"100%"}}>
             {view==="landing"  &&<Landing  setView={setView} algoId={algoId} frames={frames} refStr={refStr}/>}
             {view==="algos"    &&<Algos    algoId={algoId} setAlgoId={setAlgoId} setView={setView}/>}
             {view==="simulate" &&<Simulate algoId={algoId} frames={frames} setFrames={setFrames}
@@ -273,7 +322,7 @@ function Landing({setView}){
   ];
 
   return(
-    <div style={{minHeight:"100vh",position:"relative",overflow:"hidden"}}>
+    <div style={{width:"100%",minHeight:"100%",position:"relative",background:C.bg0}}>
       {/* bg effects */}
       <div style={{position:"absolute",inset:0,pointerEvents:"none",overflow:"hidden"}}>
         <div style={{position:"absolute",inset:0,backgroundImage:`linear-gradient(rgba(59,130,246,0.035) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,0.035) 1px,transparent 1px)`,backgroundSize:"52px 52px"}}/>
@@ -291,8 +340,8 @@ function Landing({setView}){
 
       {/* TOPNAV */}
       <nav style={{position:"sticky",top:0,zIndex:200,backdropFilter:"blur(24px)",
-        background:"rgba(7,9,15,0.85)",borderBottom:`1px solid ${C.b0}`,
-        display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 36px",height:52}}>
+        background:"rgba(7,9,15,0.85)",borderBottom:`1px solid ${C.b0}`,width:"100%",
+        display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 6%",height:52}}>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <div style={{width:26,height:26,background:"linear-gradient(135deg,#3B82F6,#8B5CF6)",
             borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:900,color:"#fff",fontFamily:C.head}}>P</div>
@@ -307,7 +356,7 @@ function Landing({setView}){
       </nav>
 
       {/* HERO */}
-      <section style={{position:"relative",zIndex:1,padding:"72px 36px 60px",maxWidth:1100,margin:"0 auto",
+      <section style={{position:"relative",zIndex:1,padding:"72px 6% 60px",width:"100%",
         display:"grid",gridTemplateColumns:"1fr 1fr",gap:52,alignItems:"center"}}>
         <div>
           <div style={{display:"inline-flex",alignItems:"center",gap:7,background:"rgba(59,130,246,0.09)",
@@ -316,7 +365,7 @@ function Landing({setView}){
             <span style={{fontSize:10,fontFamily:C.mono,color:C.blue,letterSpacing:"0.1em"}}>OS MEMORY MANAGEMENT SIMULATOR</span>
           </div>
           <h1 style={{fontFamily:C.head,fontSize:"clamp(34px,5vw,56px)",fontWeight:900,lineHeight:1.05,letterSpacing:"-0.045em",marginBottom:18}}>
-            Page Replacement<br/>
+            <span style={{color:"#FFFFFF"}}>Page Replacement</span><br/>
             <span style={{background:"linear-gradient(105deg,#3B82F6 0%,#8B5CF6 45%,#06B6D4 90%)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>Algorithms</span>
           </h1>
           <p style={{fontSize:15,color:C.t1,lineHeight:1.75,marginBottom:30,maxWidth:450}}>
@@ -327,7 +376,7 @@ function Landing({setView}){
             <button className="b1 bghost" style={{padding:"10px 24px",fontSize:14}} onClick={()=>setView("algos")}>Browse Algorithms →</button>
           </div>
           <div style={{display:"flex",gap:28}}>
-            {[["6","Algorithms"],["Real-time","Visualization"],["Step","Controls"]].map(([v,l])=>(
+            {[["7","Algorithms"],["Real-time","Visualization"],["Step","Controls"]].map(([v,l])=>(
               <div key={l}>
                 <div style={{fontFamily:C.head,fontWeight:800,fontSize:22,letterSpacing:"-0.04em"}}>{v}</div>
                 <div style={{fontSize:11,color:C.t2,marginTop:1}}>{l}</div>
@@ -406,7 +455,7 @@ function Landing({setView}){
       </section>
 
       {/* FEATURES */}
-      <section style={{position:"relative",zIndex:1,padding:"0 36px 72px",maxWidth:1100,margin:"0 auto"}}>
+      <section style={{position:"relative",zIndex:1,padding:"0 6% 72px",width:"100%"}}>
         <div style={{borderTop:`1px solid ${C.b0}`,paddingTop:56,marginBottom:40,textAlign:"center"}}>
           <h2 style={{fontFamily:C.head,fontWeight:800,fontSize:"clamp(22px,3vw,34px)",letterSpacing:"-0.04em",marginBottom:8}}>
             Everything you need to understand<br/>memory management
@@ -429,7 +478,7 @@ function Landing({setView}){
       </section>
 
       {/* ALGO GRID */}
-      <section style={{position:"relative",zIndex:1,padding:"0 36px 72px",maxWidth:1100,margin:"0 auto"}}>
+      <section style={{position:"relative",zIndex:1,padding:"0 6% 72px",width:"100%"}}>
         <div style={{borderTop:`1px solid ${C.b0}`,paddingTop:56}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",marginBottom:28}}>
             <div>
@@ -455,9 +504,9 @@ function Landing({setView}){
       </section>
 
       {/* CTA */}
-      <section style={{position:"relative",zIndex:1,padding:"0 36px 90px",maxWidth:680,margin:"0 auto",textAlign:"center"}}>
+      <section style={{position:"relative",zIndex:1,padding:"0 6% 90px",width:"100%",textAlign:"center"}}>
         <div style={{background:"linear-gradient(140deg,rgba(59,130,246,0.055),rgba(139,92,246,0.055))",
-          border:"1px solid rgba(99,102,241,0.18)",borderRadius:14,padding:"44px 36px"}}>
+          border:"1px solid rgba(99,102,241,0.18)",borderRadius:14,padding:"44px 36px",maxWidth:680,margin:"0 auto"}}>
           <h2 style={{fontFamily:C.head,fontWeight:900,fontSize:"clamp(22px,3vw,32px)",letterSpacing:"-0.04em",marginBottom:10}}>Ready to simulate?</h2>
           <p style={{color:C.t1,fontSize:14,marginBottom:26,lineHeight:1.7}}>Pick an algorithm, set your reference string, and watch memory management unfold step by step.</p>
           <div style={{display:"flex",gap:9,justifyContent:"center"}}>
@@ -467,7 +516,7 @@ function Landing({setView}){
         </div>
       </section>
 
-      <footer style={{borderTop:`1px solid ${C.b0}`,padding:"18px 36px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"relative",zIndex:1}}>
+      <footer style={{borderTop:`1px solid ${C.b0}`,padding:"18px 6%",width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",position:"relative",zIndex:1}}>
         <span style={{fontFamily:C.mono,fontSize:9,color:C.t2}}>PageSim · OS Memory Management Simulator</span>
         <div style={{display:"flex",gap:12}}>
           {[["algos","Algorithms"],["simulate","Simulate"],["compare","Compare"],["learn","Learn"]].map(([id,l])=>(
@@ -484,9 +533,9 @@ function Landing({setView}){
 ════════════════════════════════════════════════════════ */
 function Algos({algoId,setAlgoId,setView}){
   return(
-    <div style={{padding:"26px 22px",maxWidth:920}}>
+    <div style={{padding:"26px 4% 26px",width:"100%"}}>
       <H title="Algorithms" sub="Select an algorithm to simulate"/>
-      {["Classic","Adaptive"].map(type=>(
+      {["Classic","Adaptive","Hybrid"].map(type=>(
         <div key={type} style={{marginBottom:30}}>
           <Div label={type}/>
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(255px,1fr))",gap:9}}>
@@ -517,7 +566,16 @@ function Algos({algoId,setAlgoId,setView}){
 ════════════════════════════════════════════════════════ */
 function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpeed,setView}){
   const algo=ALGOS[algoId];
-  const {steps,faults}=useMemo(()=>algo.run(frames,refArr),[algo,frames,refArr]);
+  const isAWS=algoId==="AWS";
+
+  // AWS-specific params
+  const [awsWindow,setAwsWindow]=useState(3);
+  const [awsThresh,setAwsThresh]=useState(3);
+
+  const {steps,faults}=useMemo(()=>{
+    if(isAWS)return algo.run(frames,refArr,awsWindow,awsThresh);
+    return algo.run(frames,refArr);
+  },[algo,frames,refArr,awsWindow,awsThresh,isAWS]);
   const hits=steps.filter(s=>s.hit).length;
 
   const [step,setStep]=useState(-1);
@@ -525,7 +583,7 @@ function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpee
   const [tick,setTick]=useState(0);
   const timer=useRef();
 
-  useEffect(()=>{setStep(-1);setPlay(false);},[algoId,frames,refStr]);
+  useEffect(()=>{setStep(-1);setPlay(false);},[algoId,frames,refStr,awsWindow,awsThresh]);
   useEffect(()=>{
     if(playing){timer.current=setInterval(()=>{setStep(s=>{if(s>=steps.length-1){setPlay(false);return s;}setTick(t=>t+1);return s+1;});},speed);}
     return()=>clearInterval(timer.current);
@@ -544,14 +602,20 @@ function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpee
   const fN=steps.slice(0,step+1).filter(s=>s.fault).length;
   const hN=steps.slice(0,step+1).filter(s=>s.hit).length;
 
+  // AWS status color
+  const awsStatus=cur?.status||"stable";
+  const awsStatusColor=awsStatus==="stable"?C.green:awsStatus==="adjusting"?C.amber:C.red;
+  const awsStatusLabel=awsStatus==="stable"?"● Stable":awsStatus==="adjusting"?"⟳ Adjusting Memory":"▲ High Fault Rate";
+
   return(
-    <div style={{padding:"22px 22px",maxWidth:1060}}>
+    <div style={{padding:"22px 3%",width:"100%"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,flexWrap:"wrap",gap:10}}>
         <div style={{display:"flex",alignItems:"center",gap:9}}>
           <button className="b1 bghost bsm" onClick={()=>setView("algos")}>← {algo.label}</button>
           <span style={{color:C.t2}}>|</span>
           <span style={{fontFamily:C.head,fontWeight:800,fontSize:16}}>{algo.full}</span>
           <span className="chip" style={{background:`${algo.color}17`,color:algo.color}}>{algo.type}</span>
+          {isAWS&&<span style={{fontFamily:C.mono,fontSize:10,color:awsStatusColor,background:`${awsStatusColor}15`,border:`1px solid ${awsStatusColor}40`,padding:"2px 9px",borderRadius:4,transition:"all 0.3s"}}>{awsStatusLabel}</span>}
         </div>
         <div style={{display:"flex",gap:6}}>
           {[["Space","Play/Pause"],["←→","Step"],["R","Reset"]].map(([k,l])=>(
@@ -563,7 +627,8 @@ function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpee
         </div>
       </div>
 
-      <div style={{display:"grid",gridTemplateColumns:"1fr 255px",gap:13}}>
+      <div style={{display:"grid",gridTemplateColumns:isAWS?"1fr 260px 220px":"1fr 260px",gap:13,width:"100%"}}>
+        {/* ── MAIN SIMULATION COLUMN ── */}
         <div style={{display:"flex",flexDirection:"column",gap:11}}>
           {/* ref string */}
           <div className="card" style={{padding:"13px 15px"}}>
@@ -593,37 +658,50 @@ function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpee
 
           {/* frames */}
           <div className="card" style={{padding:"15px 17px"}}>
-            <div style={{fontSize:9,fontFamily:C.mono,color:C.t2,letterSpacing:"0.1em",marginBottom:13}}>MEMORY FRAMES</div>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:13}}>
+              <span style={{fontSize:9,fontFamily:C.mono,color:C.t2,letterSpacing:"0.1em"}}>MEMORY FRAMES</span>
+              {isAWS&&cur?.dynWindow&&<span style={{fontSize:9,fontFamily:C.mono,color:C.amber}}>Δ window = {cur.dynWindow}</span>}
+            </div>
             <div style={{display:"grid",gridTemplateColumns:`repeat(${Math.min(frames,8)},1fr)`,gap:9}}>
               {(cur?.frames||Array(frames).fill(null)).map((pg,fi)=>{
                 const prev=step>0?steps[step-1]?.frames[fi]:null;
                 const isNew=cur&&!cur.hit&&cur.frames[fi]===cur.page&&prev!==cur.frames[fi];
                 const empty=pg===null||pg===undefined;
+                const inWS=isAWS&&cur?.workingSet&&pg!=null&&cur.workingSet.includes(pg);
                 return(
                   <div key={fi} className={isNew?(cur?.hit?"fh":"ff"):""}
-                    style={{background:isNew?(cur?.hit?"rgba(16,185,129,0.09)":"rgba(244,63,94,0.09)"):empty?C.bg2:C.bg3,
-                      border:`1px solid ${isNew?(cur?.hit?C.green:C.red):empty?C.b0:C.b1}`,
+                    style={{
+                      background:isNew?(cur?.hit?"rgba(16,185,129,0.09)":"rgba(244,63,94,0.09)"):
+                        inWS?"rgba(245,158,11,0.07)":empty?C.bg2:C.bg3,
+                      border:`1px solid ${isNew?(cur?.hit?C.green:C.red):inWS?"rgba(245,158,11,0.5)":empty?C.b0:C.b1}`,
                       borderRadius:9,padding:"15px 9px",textAlign:"center",
-                      transition:"all 0.22s cubic-bezier(0.34,1.56,0.64,1)",
-                      boxShadow:isNew?`0 0 16px ${cur?.hit?"rgba(16,185,129,0.18)":"rgba(244,63,94,0.18)"}`:"none",
+                      transition:"all 0.28s cubic-bezier(0.34,1.56,0.64,1)",
+                      boxShadow:isNew?`0 0 16px ${cur?.hit?"rgba(16,185,129,0.18)":"rgba(244,63,94,0.18)"}`:
+                        inWS?"0 0 12px rgba(245,158,11,0.15)":"none",
                       position:"relative",overflow:"hidden"}}>
                     {isNew&&<div style={{position:"absolute",inset:0,
                       background:`radial-gradient(circle at center,${cur?.hit?"rgba(16,185,129,0.07)":"rgba(244,63,94,0.07)"},transparent 70%)`,
                       pointerEvents:"none"}}/>}
-                    <div style={{fontSize:8,fontFamily:C.mono,color:C.t2,marginBottom:5,letterSpacing:"0.1em"}}>F{fi+1}</div>
+                    {inWS&&!isNew&&<div style={{position:"absolute",inset:0,
+                      background:"radial-gradient(circle at center,rgba(245,158,11,0.06),transparent 70%)",
+                      pointerEvents:"none"}}/>}
+                    <div style={{fontSize:8,fontFamily:C.mono,color:inWS?C.amber:C.t2,marginBottom:5,letterSpacing:"0.1em"}}>
+                      {inWS?"WS":"F"}{fi+1}
+                    </div>
                     <div style={{fontFamily:C.mono,fontSize:24,fontWeight:700,
-                      color:empty?C.bg4:isNew?(cur?.hit?C.green:C.red):C.t0,
+                      color:empty?C.bg4:isNew?(cur?.hit?C.green:C.red):inWS?C.amber:C.t0,
                       letterSpacing:"-0.04em",transition:"color 0.2s"}}>
                       {empty?"·":pg}
                     </div>
                     {isNew&&<div style={{height:2,background:cur?.hit?C.green:C.red,borderRadius:1,marginTop:7,width:"55%",marginInline:"auto"}}/>}
+                    {inWS&&!isNew&&<div style={{height:2,background:C.amber,borderRadius:1,marginTop:7,width:"40%",marginInline:"auto",opacity:0.6}}/>}
                   </div>
                 );
               })}
             </div>
           </div>
 
-          {/* status */}
+          {/* status bar */}
           {cur&&(
             <div className="stk card" key={tick}
               style={{padding:"10px 15px",display:"flex",alignItems:"center",gap:11,
@@ -636,6 +714,7 @@ function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpee
                 <div style={{fontSize:10,color:C.t2}}>
                   Page <span style={{fontFamily:C.mono,color:C.t1}}>{cur.page}</span>
                   {cur.hit?" is already in memory":cur.evicted?` loaded — evicted page ${cur.evicted}`:" loaded into empty frame"}
+                  {isAWS&&cur.adapted&&<span style={{color:C.amber,marginLeft:6}}>· window expanded to {cur.dynWindow}</span>}
                 </div>
               </div>
               <div style={{marginLeft:"auto",display:"flex",gap:14}}>
@@ -656,13 +735,16 @@ function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpee
               <span style={{fontSize:9,fontFamily:C.mono,color:C.t2}}>{steps.length?Math.round((step+1)/steps.length*100):0}%</span>
             </div>
             <div style={{display:"flex",gap:2,marginBottom:7}}>
-              {steps.map((s,i)=>(
-                <div key={i} onClick={()=>{setStep(i);setPlay(false);}}
-                  title={`Step ${i+1}: ${s.fault?"FAULT":"HIT"} pg${s.page}`}
-                  style={{flex:1,height:6,borderRadius:2,cursor:"pointer",
-                    background:i<=step?(s.fault?C.red:C.green):C.bg4,
-                    opacity:i===step?1:0.6,transition:"background 0.15s"}}/>
-              ))}
+              {steps.map((s,i)=>{
+                const isAdapt=isAWS&&s.adapted;
+                return(
+                  <div key={i} onClick={()=>{setStep(i);setPlay(false);}}
+                    title={`Step ${i+1}: ${s.fault?"FAULT":"HIT"} pg${s.page}${isAdapt?" [ADAPTED]":""}`}
+                    style={{flex:1,height:isAdapt?9:6,borderRadius:2,cursor:"pointer",
+                      background:i<=step?(s.fault?(isAdapt?C.amber:C.red):C.green):C.bg4,
+                      opacity:i===step?1:0.6,transition:"all 0.15s"}}/>
+                );
+              })}
             </div>
             <input type="range" min="-1" max={steps.length-1} value={step}
               onChange={e=>{setStep(+e.target.value);setPlay(false);}} style={{width:"100%"}}/>
@@ -690,7 +772,7 @@ function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpee
           </div>
         </div>
 
-        {/* config panel */}
+        {/* ── CONFIG PANEL ── */}
         <div style={{display:"flex",flexDirection:"column",gap:9}}>
           <div className="card" style={{padding:"13px"}}>
             <FL>Frames: <span style={{color:C.blue,fontFamily:C.mono}}>{frames}</span></FL>
@@ -703,6 +785,19 @@ function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpee
               setRefStr(Array.from({length:14},()=>Math.floor(Math.random()*7)).join(","));
             }}>🎲 Random</button>
           </div>
+
+          {/* AWS-specific controls */}
+          {isAWS&&(
+            <div className="card" style={{padding:"13px",border:"1px solid rgba(245,158,11,0.25)",background:"rgba(245,158,11,0.03)"}}>
+              <div style={{fontSize:9,fontFamily:C.mono,color:C.amber,letterSpacing:"0.1em",marginBottom:12}}>⚙ AWS PARAMETERS</div>
+              <FL>WS Window Δ: <span style={{color:C.amber,fontFamily:C.mono}}>{awsWindow}</span></FL>
+              <input type="range" min="1" max="10" value={awsWindow} onChange={e=>setAwsWindow(+e.target.value)} style={{width:"100%",marginBottom:12,accentColor:C.amber}}/>
+              <FL>PFF Threshold: <span style={{color:C.amber,fontFamily:C.mono}}>{awsThresh}</span></FL>
+              <input type="range" min="1" max="8" value={awsThresh} onChange={e=>setAwsThresh(+e.target.value)} style={{width:"100%",accentColor:C.amber}}/>
+              <div style={{marginTop:10,fontSize:9,color:C.t2,lineHeight:1.6}}>Δ adapts at runtime. Amber frames = in working set.</div>
+            </div>
+          )}
+
           <div className="card" style={{padding:"13px"}}>
             <FL style={{marginBottom:9}}>Presets</FL>
             {PRESETS.map((p,i)=>(
@@ -728,6 +823,91 @@ function Simulate({algoId,frames,setFrames,refStr,setRefStr,refArr,speed,setSpee
             ))}
           </div>
         </div>
+
+        {/* ── AWS LIVE MONITOR PANEL ── */}
+        {isAWS&&(
+          <div style={{display:"flex",flexDirection:"column",gap:9}}>
+            {/* Status card */}
+            <div style={{background:C.bg1,border:`1px solid ${awsStatusColor}40`,borderRadius:10,padding:"14px",
+              transition:"border-color 0.4s"}}>
+              <div style={{fontSize:9,fontFamily:C.mono,color:C.t2,letterSpacing:"0.1em",marginBottom:10}}>SYSTEM STATUS</div>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+                <div style={{width:10,height:10,borderRadius:"50%",background:awsStatusColor,
+                  boxShadow:`0 0 10px ${awsStatusColor}`,
+                  animation:awsStatus==="stable"?"none":"glowBeat 1s ease infinite"}}/>
+                <span style={{fontFamily:C.head,fontWeight:800,fontSize:13,color:awsStatusColor,transition:"color 0.3s"}}>
+                  {awsStatus==="stable"?"Stable":awsStatus==="adjusting"?"Adjusting Memory":"High Fault Rate"}
+                </span>
+              </div>
+              {[
+                {l:"Fault Freq",v:cur?`${cur.faultFreq}`:"—",c:C.red},
+                {l:"Dyn. Window",v:cur?`Δ = ${cur.dynWindow}`:awsWindow,c:C.amber},
+                {l:"WS Size",v:cur?.workingSet?cur.workingSet.length:"—",c:C.blue},
+              ].map((s,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",
+                  padding:"5px 0",borderBottom:i<2?`1px solid ${C.b0}`:"none"}}>
+                  <span style={{fontSize:10,color:C.t2}}>{s.l}</span>
+                  <span style={{fontFamily:C.mono,fontWeight:600,fontSize:11,color:s.c,transition:"color 0.3s"}}>{s.v}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Working Set panel */}
+            <div className="card" style={{padding:"14px"}}>
+              <div style={{fontSize:9,fontFamily:C.mono,color:C.amber,letterSpacing:"0.1em",marginBottom:10}}>WORKING SET</div>
+              {cur?.workingSet&&cur.workingSet.length>0?(
+                <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                  {cur.workingSet.map((pg,i)=>(
+                    <div key={i} className="stk" style={{
+                      width:32,height:32,borderRadius:6,
+                      display:"flex",alignItems:"center",justifyContent:"center",
+                      fontFamily:C.mono,fontWeight:700,fontSize:13,
+                      background:"rgba(245,158,11,0.1)",
+                      border:"1px solid rgba(245,158,11,0.4)",
+                      color:C.amber,boxShadow:"0 0 8px rgba(245,158,11,0.15)",
+                      transition:"all 0.25s"}}>
+                      {pg}
+                    </div>
+                  ))}
+                </div>
+              ):(
+                <div style={{fontSize:11,color:C.t2,fontStyle:"italic"}}>No active working set yet</div>
+              )}
+            </div>
+
+            {/* Adaptation history */}
+            <div className="card" style={{padding:"14px",flex:1,overflow:"hidden"}}>
+              <div style={{fontSize:9,fontFamily:C.mono,color:C.t2,letterSpacing:"0.1em",marginBottom:10}}>ADAPTATION LOG</div>
+              <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:180,overflowY:"auto"}}>
+                {steps.slice(0,step+1).filter(s=>s.adapted).slice(-8).reverse().map((s,i)=>(
+                  <div key={i} style={{display:"flex",gap:7,alignItems:"flex-start",
+                    padding:"5px 7px",borderRadius:5,background:"rgba(245,158,11,0.05)",
+                    border:"1px solid rgba(245,158,11,0.15)"}}>
+                    <span style={{fontSize:9,color:C.amber,fontFamily:C.mono,flexShrink:0}}>pg{s.page}</span>
+                    <span style={{fontSize:9,color:C.t2}}>Window → Δ={s.dynWindow}</span>
+                  </div>
+                ))}
+                {steps.slice(0,step+1).filter(s=>s.adapted).length===0&&(
+                  <div style={{fontSize:10,color:C.t2,fontStyle:"italic"}}>No adaptations yet</div>
+                )}
+              </div>
+            </div>
+
+            {/* Fault rate bar */}
+            <div className="card" style={{padding:"14px"}}>
+              <div style={{fontSize:9,fontFamily:C.mono,color:C.t2,letterSpacing:"0.1em",marginBottom:8}}>FAULT RATE GAUGE</div>
+              <div style={{height:6,background:C.bg4,borderRadius:3,overflow:"hidden",marginBottom:5}}>
+                <div style={{height:"100%",borderRadius:3,transition:"width 0.4s ease, background 0.4s ease",
+                  width:`${Math.min(100,((cur?.faultFreq||0))*100)}%`,
+                  background:awsStatus==="stable"?C.green:awsStatus==="adjusting"?C.amber:C.red}}/>
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between"}}>
+                <span style={{fontSize:9,color:C.green,fontFamily:C.mono}}>0 Low</span>
+                <span style={{fontSize:9,color:C.red,fontFamily:C.mono}}>High 1</span>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -759,7 +939,7 @@ function Compare({frames:gf,refStr:gr,setRefStr,setFrames}){
   const worst=results[results.length-1];
 
   return(
-    <div style={{padding:"22px 22px",maxWidth:1060}}>
+    <div style={{padding:"22px 3%",width:"100%"}}>
       <H title="Algorithm Comparison" sub="Evaluate all algorithms on the same reference string"/>
 
       {/* CONFIG */}
@@ -803,12 +983,16 @@ function Compare({frames:gf,refStr:gr,setRefStr,setFrames}){
           {/* WINNER / LOSER */}
           {results.length>=2&&(
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginBottom:16}}>
-              <div style={{background:"rgba(16,185,129,0.055)",border:"1px solid rgba(16,185,129,0.18)",borderRadius:9,padding:"11px 15px",display:"flex",alignItems:"center",gap:9}}>
-                <span style={{fontSize:18}}>🏆</span>
+              <div style={{background:best.id==="AWS"?"rgba(245,158,11,0.07)":"rgba(16,185,129,0.055)",
+                border:`1px solid ${best.id==="AWS"?"rgba(245,158,11,0.3)":"rgba(16,185,129,0.18)"}`,
+                borderRadius:9,padding:"11px 15px",display:"flex",alignItems:"center",gap:9}}>
+                <span style={{fontSize:18}}>{best.id==="AWS"?"⚡":"🏆"}</span>
                 <div>
-                  <div style={{fontSize:8,fontFamily:C.mono,color:C.t2,marginBottom:1,letterSpacing:"0.1em"}}>BEST PERFORMER</div>
-                  <div style={{fontFamily:C.head,fontWeight:800,fontSize:13}}>{best.full}</div>
-                  <div style={{fontSize:10,color:C.green,fontFamily:C.mono}}>{best.faults} faults · {best.hr}% hit rate</div>
+                  <div style={{fontSize:8,fontFamily:C.mono,color:C.t2,marginBottom:1,letterSpacing:"0.1em"}}>
+                    {best.id==="AWS"?"⚡ HYBRID ALGORITHM WINS":"BEST PERFORMER"}
+                  </div>
+                  <div style={{fontFamily:C.head,fontWeight:800,fontSize:13,color:best.id==="AWS"?C.amber:C.t0}}>{best.full}</div>
+                  <div style={{fontSize:10,color:best.id==="AWS"?C.amber:C.green,fontFamily:C.mono}}>{best.faults} faults · {best.hr}% hit rate</div>
                 </div>
               </div>
               <div style={{background:"rgba(244,63,94,0.04)",border:"1px solid rgba(244,63,94,0.14)",borderRadius:9,padding:"11px 15px",display:"flex",alignItems:"center",gap:9}}>
@@ -817,6 +1001,11 @@ function Compare({frames:gf,refStr:gr,setRefStr,setFrames}){
                   <div style={{fontSize:8,fontFamily:C.mono,color:C.t2,marginBottom:1,letterSpacing:"0.1em"}}>MOST FAULTS</div>
                   <div style={{fontFamily:C.head,fontWeight:800,fontSize:13}}>{worst.full}</div>
                   <div style={{fontSize:10,color:C.red,fontFamily:C.mono}}>{worst.faults} faults · {worst.hr}% hit rate</div>
+                  {results.find(r=>r.id==="AWS")&&worst.id!=="AWS"&&(()=>{
+                    const awsR=results.find(r=>r.id==="AWS");
+                    const diff=worst.faults-awsR.faults;
+                    return diff>0?<div style={{fontSize:9,color:C.amber,marginTop:2}}>AWS saves {diff} faults vs this</div>:null;
+                  })()}
                 </div>
               </div>
             </div>
@@ -949,7 +1138,7 @@ function Learn(){
   const a=ALGOS[active];
   const d=LEARN_DATA[active];
   return(
-    <div style={{padding:"22px 22px",maxWidth:900}}>
+    <div style={{padding:"22px 3%",width:"100%"}}>
       <H title="Algorithm Reference" sub="Step-by-step breakdowns, trade-offs, and worked examples"/>
       <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:22}}>
         {Object.values(ALGOS).map(al=>(
